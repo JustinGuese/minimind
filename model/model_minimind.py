@@ -217,16 +217,19 @@ class MOEFeedForward(nn.Module):
     def _grouped_forward(self, x_flat, topk_idx, topk_weight):  # 分组GEMM：把token按专家排序成连续段，一次kernel算完所有段，与上面的专家循环数学等价
         e, k, dev = self.config.num_experts, topk_idx.shape[-1], x_flat.device
         n, dt, ct = x_flat.shape[0], x_flat.dtype, _grouped_dtype(x_flat)
-        rows = n * k + e
         # 给每个专家补一行权重为0的哑元：_grouped_mm 遇到零宽分组会死锁，补齐后每段宽度必然≥1。
         # 这样 offs 可以用 searchsorted 直接算出来，整个分发过程没有任何 device→host 同步
         #（而原循环每个专家都有 mask.any() / nonzero() 两次同步），零token专家也不需要特判。
-        pad = torch.arange(e, device=dev, dtype=topk_idx.dtype)
+        # 再把总行数补到16的倍数：backward 里 xᵀ 的主步长就是总行数，_grouped_mm 要求步长16字节对齐。
+        extra = -(n * k + e) % 16
+        rows = n * k + e + extra
+        eids = torch.arange(e, device=dev, dtype=topk_idx.dtype)
+        pad = torch.cat([eids, eids.new_full((extra,), e - 1)])  # 多出来的对齐行并入最后一段，权重同样为0
         idx = torch.cat([topk_idx.reshape(-1), pad])
-        wgt = torch.cat([topk_weight.reshape(-1), topk_weight.new_zeros(e)])
+        wgt = torch.cat([topk_weight.reshape(-1), topk_weight.new_zeros(e + extra)])
         tok = torch.arange(rows, device=dev).div_(k, rounding_mode='floor').clamp_(max=n - 1)  # 哑元行落到最后一个token，权重为0不影响结果
         idx_s, order = torch.sort(idx, stable=True)
-        offs = torch.searchsorted(idx_s, pad, right=True).to(torch.int32)  # 累积END偏移
+        offs = torch.searchsorted(idx_s, eids, right=True).to(torch.int32)  # 累积END偏移
         def W(name):  # 堆成 (E,K,N)：先转计算精度再转置再stack，避免额外materialize一份fp32的堆叠副本
             return torch.stack([getattr(x, name).weight.to(ct).t() for x in self.experts])  # 无条件遍历全部专家 → DDP下每个专家参数都在计算图里
         xs = x_flat.index_select(0, tok[order]).to(ct)

@@ -197,7 +197,14 @@ def test_min_rows_threshold_keeps_decode_on_loop():
 
 
 def test_cuda_real_kernel():
-    """C1/C2 在真实 torch._grouped_mm 上的版本；无 CUDA/bf16 则跳过。"""
+    """C1/C2 在真实 torch._grouped_mm 上的版本；无 CUDA/bf16 则跳过。
+
+    前向要求逐位一致（torch.equal）。反向做不到逐位一致，原因明确：grad_w = xᵀ@go 是
+    在 token 维上的归约，分组kernel 的 tiling/split-K 与逐专家 cuBLAS 不同，bf16 下
+    累加顺序不同必然产生末位差异。因此这里不比绝对容差，而是比一个更有意义的量：
+    分组与循环之间的差，必须远小于循环自身相对 fp32 的 bf16 量化误差——
+    即分组路径引入的噪声被现有实现已有的误差淹没。
+    """
     if not torch.cuda.is_available(): raise Skip('无 CUDA')
     dev = 'cuda'
     a = build(seed=17, hidden_size=768, moe_intermediate_size=2432).to(dev)
@@ -209,20 +216,30 @@ def test_cuda_real_kernel():
     with torch.amp.autocast('cuda', dtype=torch.bfloat16):
         if not mm._grouped_ok(x.view(-1, 768), b.config): raise Skip('本机 torch._grouped_mm 不可用（能力探测失败）')
         ya, yb = a(x), b(x)
-    scale = ya.abs().max().item()
-    rel = (ya - yb).abs().max().item() / max(scale, 1e-12)
-    print(f'    [cuda] max|Δ|/max|y| = {rel:.3e}  bit-exact={torch.equal(ya, yb)}')
     assert torch.equal(a.aux_loss, b.aux_loss), 'aux_loss 必须完全一致'
-    assert rel < 2e-2, f'相对误差过大: {rel:.3e}'
-    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-        a(x).sum().backward(); b(x).sum().backward()
+    assert torch.equal(ya, yb), f'前向必须逐位一致, max|Δ|={(ya - yb).abs().max().item():.3e}'
+    print(f'    [cuda] 前向 bit-exact={torch.equal(ya, yb)}')
+
+    def grads(m, autocast):
+        m.zero_grad(set_to_none=True)
+        if autocast:
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16): m(x).sum().backward()
+        else: m(x).sum().backward()
+        return {f'{e}.{p}': getattr(m.experts[e], f'{p}_proj').weight.grad.detach().float().clone()
+                for e in range(4) for p in ('gate', 'up', 'down')}
+
+    ref = grads(build(seed=17, hidden_size=768, moe_intermediate_size=2432).to(dev), False)  # fp32 循环 = 基准
+    gl, gg = grads(a, True), grads(b, True)
+    scale = {k: max(v.abs().max().item(), 1e-12) for k, v in ref.items()}
+    e_loop = max((gl[k] - ref[k]).abs().max().item() / scale[k] for k in ref)
+    e_grp = max((gg[k] - ref[k]).abs().max().item() / scale[k] for k in ref)
+    e_diff = max((gl[k] - gg[k]).abs().max().item() / scale[k] for k in ref)
+    print(f'    [cuda] 反向相对 fp32: 循环={e_loop:.3e} 分组={e_grp:.3e}; 两者之差={e_diff:.3e}')
     for e in range(4):
         for p in ('gate', 'up', 'down'):
-            ga = getattr(a.experts[e], f'{p}_proj').weight.grad
-            gb = getattr(b.experts[e], f'{p}_proj').weight.grad
-            assert gb is not None, f'experts.{e}.{p}_proj 梯度为 None'
-            r = (ga - gb).abs().max().item() / max(ga.abs().max().item(), 1e-12)
-            assert r < 5e-2, f'experts.{e}.{p}_proj 梯度相对误差过大: {r:.3e}'
+            assert getattr(b.experts[e], f'{p}_proj').weight.grad is not None, f'experts.{e}.{p}_proj 梯度为 None'
+    assert e_grp <= e_loop * 1.5, f'分组路径反向误差显著大于循环: {e_grp:.3e} vs {e_loop:.3e}'
+    assert e_diff < e_loop, f'两条路径之差({e_diff:.3e})应远小于 bf16 自身误差({e_loop:.3e})'
 
 
 # ============================== runner ==============================
