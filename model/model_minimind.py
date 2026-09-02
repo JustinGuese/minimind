@@ -186,8 +186,47 @@ class MOEFeedForward(nn.Module):
         super().__init__()
         self.config = config
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
-        self.experts = nn.ModuleList([FeedForward(config, intermediate_size=config.moe_intermediate_size) for _ in range(config.num_experts)])
+        self.fused = bool(getattr(config, 'moe_grouped_gemm', False))
+        if not self.fused:
+            self.experts = nn.ModuleList([FeedForward(config, intermediate_size=config.moe_intermediate_size) for _ in range(config.num_experts)])
+        else:
+            # 先照原样把每个专家建出来再折叠成融合权重：RNG 的消耗顺序与上面完全一致，
+            # 所以同一种子下从零训练与关闭开关时逐位相同。融合后直接按 _grouped_mm 需要的
+            # (E,K,N) 存放，前向无需任何转置或堆叠；gate/up 合成一份，少一次 kernel。
+            with torch.no_grad():
+                ref = [FeedForward(config, intermediate_size=config.moe_intermediate_size) for _ in range(config.num_experts)]
+                self.gate_up_proj = nn.Parameter(torch.stack([torch.cat([f.gate_proj.weight, f.up_proj.weight], 0).t() for f in ref]))  # (E,H,2I)
+                self.down_proj = nn.Parameter(torch.stack([f.down_proj.weight.t() for f in ref]))  # (E,I,H)
+                del ref
+            # 存盘/读盘仍然使用上游逐专家的键名，checkpoint 与开关状态无关，双向可换。
+            self._register_load_state_dict_pre_hook(self._moe_load_pre_hook)
+            (getattr(self, 'register_state_dict_post_hook', None) or self._register_state_dict_hook)(MOEFeedForward._moe_state_dict_post_hook)
         self.act_fn = ACT2FN[config.hidden_act]
+
+    def _moe_load_pre_hook(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        """把磁盘上逐专家的键就地合并成融合权重（在父类拷贝参数之前执行）。"""
+        e, i, p = self.config.num_experts, self.config.moe_intermediate_size, prefix + 'experts.'
+        want = [f'{p}{x}.{n}_proj.weight' for x in range(e) for n in ('gate', 'up', 'down')]
+        have = [k for k in want if k in state_dict]
+        if not have: return  # 已经是融合格式，或本来就缺，交给父类按缺失键处理
+        if len(have) != len(want):
+            error_msgs.append(f'{prefix}: 只找到 {len(have)}/{len(want)} 个专家权重，checkpoint 不完整')
+            for k in have: state_dict.pop(k)
+            return
+        state_dict[prefix + 'gate_up_proj'] = torch.stack([torch.cat([state_dict[f'{p}{x}.gate_proj.weight'], state_dict[f'{p}{x}.up_proj.weight']], 0).t() for x in range(e)])
+        state_dict[prefix + 'down_proj'] = torch.stack([state_dict[f'{p}{x}.down_proj.weight'].t() for x in range(e)])
+        for k in want: state_dict.pop(k)
+
+    @staticmethod
+    def _moe_state_dict_post_hook(module, state_dict, prefix, local_metadata):
+        """反向：导出成上游逐专家的键名，`.t().contiguous()` 保证与 nn.Linear.weight 布局一致且不共享存储。"""
+        gu, dn = state_dict.pop(prefix + 'gate_up_proj', None), state_dict.pop(prefix + 'down_proj', None)
+        if gu is None or dn is None: return
+        i = module.config.moe_intermediate_size
+        for x in range(module.config.num_experts):
+            state_dict[f'{prefix}experts.{x}.gate_proj.weight'] = gu[x, :, :i].t().contiguous()
+            state_dict[f'{prefix}experts.{x}.up_proj.weight'] = gu[x, :, i:].t().contiguous()
+            state_dict[f'{prefix}experts.{x}.down_proj.weight'] = dn[x].t().contiguous()
 
     def forward(self, x):
         batch_size, seq_len, hidden_dim = x.shape
@@ -195,8 +234,10 @@ class MOEFeedForward(nn.Module):
         scores = F.softmax(self.gate(x_flat), dim=-1)
         topk_weight, topk_idx = torch.topk(scores, k=self.config.num_experts_per_tok, dim=-1, sorted=False)
         if self.config.norm_topk_prob: topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
-        if _grouped_ok(x_flat, self.config) and topk_idx.numel() >= _GROUPED_MIN_ROWS:
-            y = self._grouped_forward(x_flat, topk_idx, topk_weight)
+        if self.fused:
+            y = self._grouped_forward(x_flat, topk_idx, topk_weight) \
+                if _grouped_ok(x_flat, self.config) and topk_idx.numel() >= _GROUPED_MIN_ROWS \
+                else self._fused_loop_forward(x_flat, topk_idx, topk_weight)
         else:
             y = torch.zeros_like(x_flat)
             for i, expert in enumerate(self.experts):
@@ -230,13 +271,22 @@ class MOEFeedForward(nn.Module):
         tok = torch.arange(rows, device=dev).div_(k, rounding_mode='floor').clamp_(max=n - 1)  # 哑元行落到最后一个token，权重为0不影响结果
         idx_s, order = torch.sort(idx, stable=True)
         offs = torch.searchsorted(idx_s, eids, right=True).to(torch.int32)  # 累积END偏移
-        def W(name):  # 堆成 (E,K,N)：先转计算精度再转置再stack，避免额外materialize一份fp32的堆叠副本
-            return torch.stack([getattr(x, name).weight.to(ct).t() for x in self.experts])  # 无条件遍历全部专家 → DDP下每个专家参数都在计算图里
         xs = x_flat.index_select(0, tok[order]).to(ct)
-        h = self.act_fn(_grouped_mm(xs, W('gate_proj'), offs)) * _grouped_mm(xs, W('up_proj'), offs)
-        ys = (_grouped_mm(h, W('down_proj'), offs) * wgt[order].unsqueeze(1)).to(dt)
+        g, u = _grouped_mm(xs, self.gate_up_proj.to(ct), offs).chunk(2, dim=-1)  # gate/up 一次算完
+        ys = (_grouped_mm((self.act_fn(g) * u).contiguous(), self.down_proj.to(ct), offs) * wgt[order].unsqueeze(1)).to(dt)
         inv = torch.empty_like(order).scatter_(0, order, torch.arange(rows, device=dev))
         return ys.index_select(0, inv[:n * k]).view(n, k, -1).sum(1)  # top-k>1 时按固定顺序求和，不依赖 index_add_ 的原子累加
+
+    def _fused_loop_forward(self, x_flat, topk_idx, topk_weight):  # 开关打开但环境不支持分组kernel时的回退：语义同上游循环，只是权重从融合张量里切片
+        i, y = self.config.moe_intermediate_size, torch.zeros_like(x_flat)
+        for x in range(self.config.num_experts):
+            mask = (topk_idx == x)
+            if mask.any():
+                token_idx = mask.any(dim=-1).nonzero().flatten()
+                weight = topk_weight[mask].view(-1, 1)
+                g, u = F.linear(x_flat[token_idx], self.gate_up_proj[x].t()).chunk(2, dim=-1)
+                y.index_add_(0, token_idx, (F.linear(self.act_fn(g) * u, self.down_proj[x].t()) * weight).to(y.dtype))
+        return y
 
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):

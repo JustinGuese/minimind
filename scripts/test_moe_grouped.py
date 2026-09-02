@@ -83,6 +83,22 @@ class patched:
         mm._grouped_mm, mm._grouped_ok, mm._GROUPED_MIN_ROWS = self.saved
 
 
+def pair(seed=3, **kw):
+    """一对权重完全相同的模块：a=上游循环(开关关)，b=融合布局(开关开)，经 state_dict 同步。"""
+    a = build(seed=seed, **kw)
+    b = build(seed=seed, moe_grouped_gemm=True, **kw)
+    b.load_state_dict(a.state_dict())  # 走 load 前置钩子，本身就是一次往返验证
+    a.train(); b.train()
+    return a, b
+
+
+def fused_expert_w(b, e, name):
+    """从融合参数里取出第 e 个专家的等价 nn.Linear 权重。"""
+    i = b.config.moe_intermediate_size
+    if name == 'down': return b.down_proj[e].t()
+    return b.gate_up_proj[e][:, :i].t() if name == 'gate' else b.gate_up_proj[e][:, i:].t()
+
+
 # ============================== 用例 / tests ==============================
 
 def test_flag_off_default_and_structure():
@@ -118,14 +134,40 @@ def test_flag_off_keeps_ddp_dummy_grad():
     assert torch.equal(g, torch.zeros_like(g)), '零token专家梯度应当恰好为零'
 
 
+def test_checkpoint_roundtrip_both_directions():
+    """开关开/关的 checkpoint 必须双向互换：磁盘格式始终是上游逐专家的键名。"""
+    a, b = pair(seed=3)
+    assert sorted(a.state_dict().keys()) == sorted(b.state_dict().keys()), '融合模型导出的键名必须与上游一致'
+    for k, v in a.state_dict().items():
+        assert v.shape == b.state_dict()[k].shape, f'{k} 形状不一致'
+        assert torch.equal(v, b.state_dict()[k]), f'{k} 往返后数值不一致'
+    for e in range(4):  # 融合张量里切出来的权重必须与上游 Linear 权重逐位相同
+        for p in ('gate', 'up', 'down'):
+            w = getattr(a.experts[e], f'{p}_proj').weight
+            assert torch.equal(w, fused_expert_w(b, e, p)), f'experts.{e}.{p}_proj 折叠/展开不一致'
+    c = build(seed=99)  # 反向：关闭开关的模型加载融合模型导出的 state_dict
+    r = c.load_state_dict(b.state_dict(), strict=True)
+    assert not r.missing_keys and not r.unexpected_keys, f'反向加载有缺失/多余键: {r}'
+    assert torch.equal(c.experts[2].up_proj.weight, a.experts[2].up_proj.weight)
+
+
+def test_partial_expert_keys_raise():
+    """checkpoint 残缺时必须显式报错，而不是静默留在随机初始化上（init_model 用的是 strict=False）。"""
+    a, b = pair(seed=3)
+    sd = a.state_dict(); sd.pop('experts.1.up_proj.weight')
+    for strict in (True, False):
+        try:
+            build(seed=1, moe_grouped_gemm=True).load_state_dict(sd, strict=strict)
+            assert False, f'strict={strict} 时残缺 checkpoint 应当报错'
+        except RuntimeError as ex:
+            assert '不完整' in str(ex) or 'Missing' in str(ex), f'报错信息不明确: {ex}'
+
+
 def test_grouped_matches_loop():
     """C1/C6: 分组路径与循环路径在 k 与 norm_topk_prob 各组合下数值一致，aux_loss 完全相同。"""
     for k in (1, 2, 4):
         for norm in (True, False):
-            a = build(seed=3, num_experts_per_tok=k, norm_topk_prob=norm)
-            b = build(seed=3, num_experts_per_tok=k, norm_topk_prob=norm, moe_grouped_gemm=True)
-            b.load_state_dict(a.state_dict())
-            a.train(); b.train()
+            a, b = pair(seed=3, num_experts_per_tok=k, norm_topk_prob=norm)
             torch.manual_seed(11)
             x = torch.randn(2, 32, 64)
             ya = a(x)
@@ -133,6 +175,15 @@ def test_grouped_matches_loop():
             assert torch.allclose(ya, yb, atol=1e-5, rtol=1e-5), \
                 f'k={k} norm={norm} 输出不符, max|Δ|={(ya - yb).abs().max():.3e}'
             assert torch.equal(a.aux_loss, b.aux_loss), f'k={k} norm={norm} aux_loss 不一致'
+
+
+def test_fused_loop_fallback_matches_loop():
+    """开关打开但环境不支持分组kernel时的回退路径，也必须与上游循环一致。"""
+    a, b = pair(seed=4)
+    torch.manual_seed(11)
+    x = torch.randn(2, 32, 64)
+    ya, yb = a(x), b(x)  # CPU 上能力检查为 False → 自动走 _fused_loop_forward
+    assert torch.allclose(ya, yb, atol=1e-5, rtol=1e-5), f'回退路径不符, max|Δ|={(ya - yb).abs().max():.3e}'
 
 
 def test_edge_cases():
@@ -143,9 +194,7 @@ def test_edge_cases():
         'batch<专家数': [1, 2],                      # N=2 < E=4
     }
     for name, assign in cases.items():
-        a = build(seed=5)
-        b = build(seed=5, moe_grouped_gemm=True); b.load_state_dict(a.state_dict())
-        a.train(); b.train()
+        a, b = pair(seed=5)
         x = force_routing(a, assign, 64)
         force_routing(b, assign, 64)
         ya = a(x)
@@ -155,45 +204,46 @@ def test_edge_cases():
 
 
 def test_grad_reachability_on_grouped_path():
-    """分组路径下所有专家参数都必须拿到梯度（stack 无条件遍历全部专家），否则 DDP 会挂。"""
+    """融合参数是无条件参与运算的，零token专家也必然拿到（全零）梯度，否则 DDP 会挂。"""
     b = build(seed=5, moe_grouped_gemm=True); b.train()
     x = force_routing(b, [0, 0, 0, 0, 0, 0], 64)  # 只有专家0收到 token
     with patched(): b(x).sum().backward()
-    for e in range(4):
-        for p in ('gate', 'up', 'down'):
-            g = getattr(b.experts[e], f'{p}_proj').weight.grad
-            assert g is not None, f'experts.{e}.{p}_proj 梯度为 None → DDP 会报错'
-    nz = b.experts[0].gate_proj.weight.grad.abs().sum()
-    assert nz > 0, '收到 token 的专家梯度不应为零'
+    for name in ('gate_up_proj', 'down_proj'):
+        g = getattr(b, name).grad
+        assert g is not None, f'{name} 梯度为 None → DDP(find_unused_parameters=False) 会报错'
+        assert g.shape == getattr(b, name).shape, f'{name} 梯度形状不对'
+    g = b.gate_up_proj.grad
+    assert g[0].abs().sum() > 0, '收到 token 的专家梯度不应为零'
     for e in (1, 2, 3):
-        g = b.experts[e].gate_proj.weight.grad
-        assert torch.equal(g, torch.zeros_like(g)), f'未收到 token 的 experts.{e} 梯度应恰好为零'
+        assert torch.equal(g[e], torch.zeros_like(g[e])), f'未收到 token 的专家 {e} 梯度应恰好为零'
 
 
 def test_capability_gate_falls_back():
     """C2: 开关打开但环境不支持（CPU / 无 _grouped_mm）时，必须安静回退且结果与循环一致。"""
-    m = build(seed=9, moe_grouped_gemm=True); m.train()
+    a, m = pair(seed=9)
     torch.manual_seed(13)
     x = torch.randn(2, 16, 64)
     assert mm._grouped_ok(x.view(-1, 64), m.config) is False, 'CPU 上能力检查必须返回 False'
-    assert torch.equal(m(x), reference_forward(m, x)), '回退路径输出与上游循环不一致'
+    assert torch.allclose(m(x), a(x), atol=1e-5), '回退路径输出与上游循环不一致'
 
     saved = torch._grouped_mm  # 模拟老版本 torch 没有该私有算子
     try:
         del torch._grouped_mm
         assert mm._grouped_ok(x.view(-1, 64), m.config) is False
-        assert torch.equal(m(x), reference_forward(m, x))
+        assert torch.allclose(m(x), a(x), atol=1e-5)
     finally:
         torch._grouped_mm = saved
 
 
 def test_min_rows_threshold_keeps_decode_on_loop():
     """decode 时 N=1，行数远低于阈值，必须留在循环路径（否则每 token 都要堆一次权重）。"""
-    assert mm._GROUPED_MIN_ROWS >= 256, '阈值过低会让单 token 解码付出权重堆叠开销'
-    m = build(seed=9, moe_grouped_gemm=True); m.eval()
+    assert mm._GROUPED_MIN_ROWS >= 256, '阈值过低会让单 token 解码走排序/分组的固定开销'
+    a, m = pair(seed=9)
+    a.eval(); m.eval()
     x = torch.randn(1, 1, 64)
     assert (1 * 1 * m.config.num_experts_per_tok) < mm._GROUPED_MIN_ROWS
-    assert torch.equal(m(x), reference_forward(m, x))
+    with patched():  # 即使能力检查通过，行数不足也必须留在循环路径
+        assert torch.allclose(m(x), a(x), atol=1e-5)
 
 
 def test_cuda_real_kernel():
@@ -229,23 +279,38 @@ def test_cuda_real_kernel():
                 for e in range(4) for p in ('gate', 'up', 'down')}
 
     ref = grads(build(seed=17, hidden_size=768, moe_intermediate_size=2432).to(dev), False)  # fp32 循环 = 基准
-    gl, gg = grads(a, True), grads(b, True)
+    gl = grads(a, True)
+    b.zero_grad(set_to_none=True)
+    with torch.amp.autocast('cuda', dtype=torch.bfloat16): b(x).sum().backward()
+    i = b.config.moe_intermediate_size
+    gg = {f'{e}.gate': b.gate_up_proj.grad[e][:, :i].t().float().clone() for e in range(4)}
+    gg.update({f'{e}.up': b.gate_up_proj.grad[e][:, i:].t().float().clone() for e in range(4)})
+    gg.update({f'{e}.down': b.down_proj.grad[e].t().float().clone() for e in range(4)})
     scale = {k: max(v.abs().max().item(), 1e-12) for k, v in ref.items()}
     e_loop = max((gl[k] - ref[k]).abs().max().item() / scale[k] for k in ref)
     e_grp = max((gg[k] - ref[k]).abs().max().item() / scale[k] for k in ref)
     e_diff = max((gl[k] - gg[k]).abs().max().item() / scale[k] for k in ref)
     print(f'    [cuda] 反向相对 fp32: 循环={e_loop:.3e} 分组={e_grp:.3e}; 两者之差={e_diff:.3e}')
-    for e in range(4):
-        for p in ('gate', 'up', 'down'):
-            assert getattr(b.experts[e], f'{p}_proj').weight.grad is not None, f'experts.{e}.{p}_proj 梯度为 None'
+    assert b.gate_up_proj.grad is not None and b.down_proj.grad is not None, '融合参数梯度为 None'
     assert e_grp <= e_loop * 1.5, f'分组路径反向误差显著大于循环: {e_grp:.3e} vs {e_loop:.3e}'
     assert e_diff < e_loop, f'两条路径之差({e_diff:.3e})应远小于 bf16 自身误差({e_loop:.3e})'
 
 
 # ============================== runner ==============================
 
+def test_init_bit_identical_from_scratch():
+    """同一随机种子下，开关开/关必须产生逐位相同的初始权重（融合分支的 RNG 消耗顺序要一致）。"""
+    a, b = build(seed=1234), build(seed=1234, moe_grouped_gemm=True)
+    sa, sb = a.state_dict(), b.state_dict()
+    assert sorted(sa) == sorted(sb)
+    for k in sa:
+        assert torch.equal(sa[k], sb[k]), f'{k} 从零初始化不一致 → 融合分支消耗 RNG 的顺序与上游不同'
+
+
 TESTS = [test_flag_off_default_and_structure, test_flag_off_bit_identical,
-         test_flag_off_keeps_ddp_dummy_grad, test_grouped_matches_loop, test_edge_cases,
+         test_flag_off_keeps_ddp_dummy_grad, test_init_bit_identical_from_scratch,
+         test_checkpoint_roundtrip_both_directions, test_partial_expert_keys_raise,
+         test_grouped_matches_loop, test_fused_loop_fallback_matches_loop, test_edge_cases,
          test_grad_reachability_on_grouped_path, test_capability_gate_falls_back,
          test_min_rows_threshold_keeps_decode_on_loop, test_cuda_real_kernel]
 
