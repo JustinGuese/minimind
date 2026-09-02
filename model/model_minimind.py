@@ -43,6 +43,7 @@ class MiniMindConfig(PretrainedConfig):
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
+        self.moe_sorted_dispatch = kwargs.get("moe_sorted_dispatch", False)  # 专家循环前先按专家排序，整层只需一次 device→host 同步（数学等价，无硬件要求）
         self.moe_grouped_gemm = kwargs.get("moe_grouped_gemm", False)  # 分组GEMM快速路径（需 CUDA + bf16 + torch._grouped_mm，默认关闭，不满足条件自动回退到专家循环）
 
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
@@ -191,6 +192,7 @@ class MOEFeedForward(nn.Module):
         self.config = config
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.fused = bool(getattr(config, 'moe_grouped_gemm', False))
+        self.sorted_dispatch = bool(getattr(config, 'moe_sorted_dispatch', False))
         if not self.fused:
             self.experts = nn.ModuleList([FeedForward(config, intermediate_size=config.moe_intermediate_size) for _ in range(config.num_experts)])
         else:
@@ -242,6 +244,8 @@ class MOEFeedForward(nn.Module):
             y = self._grouped_forward(x_flat, topk_idx, topk_weight) \
                 if _grouped_ok(x_flat, self.config) and topk_idx.numel() >= _GROUPED_MIN_ROWS \
                 else self._fused_loop_forward(x_flat, topk_idx, topk_weight)
+        elif self.sorted_dispatch:
+            y = self._sorted_loop_forward(x_flat, topk_idx, topk_weight)
         else:
             y = torch.zeros_like(x_flat)
             for i, expert in enumerate(self.experts):
@@ -258,6 +262,25 @@ class MOEFeedForward(nn.Module):
         else:
             self.aux_loss = scores.new_zeros(1).squeeze()
         return y.view(batch_size, seq_len, hidden_dim)
+
+    def _sorted_loop_forward(self, x_flat, topk_idx, topk_weight):
+        # 与上游循环逐位等价，只是把路由的簿记一次算完：token 先按专家排序成连续段，
+        # 每个专家直接切一段连续视图。上游每个专家都要 mask.any() / nonzero() / 布尔索引，
+        # 每次都是一趟 device→host 同步（每层约 3E 次）；这里整层只有 ends.tolist() 一次。
+        e, k, dev = self.config.num_experts, topk_idx.shape[-1], x_flat.device
+        flat = topk_idx.reshape(-1)
+        idx_s, order = torch.sort(flat, stable=True)  # stable 保证段内 token 仍按原顺序，逐位对齐上游
+        ends = torch.searchsorted(idx_s, torch.arange(e, device=dev, dtype=flat.dtype), right=True)
+        tok = order.div(k, rounding_mode='floor')
+        xs = x_flat.index_select(0, tok)
+        wgt = topk_weight.reshape(-1).index_select(0, order).unsqueeze(1)
+        bound, outs = [0] + ends.tolist(), []  # 整层唯一一次 device→host 同步
+        y = torch.zeros_like(x_flat)
+        for i, expert in enumerate(self.experts):
+            lo, hi = bound[i], bound[i + 1]
+            if hi > lo: outs.append(expert(xs[lo:hi]))  # 纯 python int 比较，不再触发同步
+            elif self.training: y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())  # 保留上游给 DDP 的空专家兜底
+        return y.index_add_(0, tok, (torch.cat(outs) * wgt).to(y.dtype)) if outs else y
 
     def _grouped_forward(self, x_flat, topk_idx, topk_weight):  # 分组GEMM：把token按专家排序成连续段，一次kernel算完所有段，与上面的专家循环数学等价
         e, k, dev = self.config.num_experts, topk_idx.shape[-1], x_flat.device
