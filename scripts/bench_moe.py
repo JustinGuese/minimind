@@ -21,7 +21,7 @@ def _sync():
     if torch.cuda.is_available(): torch.cuda.synchronize()
 
 
-def timed(step_fn, warmup=10, reps=20, steps_per_rep=5, seeds=None):
+def timed(step_fn, warmup=10, reps=20, steps_per_rep=5, seeds=None, divisor=1):
     """返回 {median, min, max, reps, seeds, peak_mem_mb}，单位为秒/步。
 
     step_fn(seed) 执行一次训练步。预热不计时；每次测量前 sync，测量 steps_per_rep 步后再 sync。
@@ -36,7 +36,7 @@ def timed(step_fn, warmup=10, reps=20, steps_per_rep=5, seeds=None):
         t0 = time.perf_counter()
         for _ in range(steps_per_rep): step_fn(seeds[r])
         _sync()
-        samples.append((time.perf_counter() - t0) / steps_per_rep)
+        samples.append((time.perf_counter() - t0) / (steps_per_rep * divisor))
     peak = torch.cuda.max_memory_allocated() / 1e6 if torch.cuda.is_available() else 0.0
     return {
         'median': statistics.median(samples), 'min': min(samples), 'max': max(samples),
@@ -51,7 +51,7 @@ def build_model(args, use_moe, num_experts=None, grouped=False, device='cuda'):
     kw = dict(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=use_moe)
     if use_moe:
         kw.update(num_experts=num_experts, num_experts_per_tok=args.top_k)
-        if grouped: kw.update(use_grouped_dispatch=True)
+        if grouped: kw.update(moe_grouped_gemm=True)
     torch.manual_seed(0)  # 各实现权重一致
     model = MiniMindForCausalLM(MiniMindConfig(**kw)).to(device)
     model.train()
@@ -67,17 +67,20 @@ def make_step(model, args, device='cuda'):
     dtype = torch.bfloat16 if args.dtype == 'bfloat16' else torch.float16
     vocab = model.config.vocab_size
 
-    def step(seed):
+    accum = max(1, args.accum)
+
+    def step(seed):  # 计时口径 = 一个 micro-batch；优化器按 accumulation_steps 摊薄，与 train_pretrain 一致
         torch.manual_seed(seed)
-        ids = torch.randint(0, vocab, (args.batch_size, args.seq_len), device=device)
-        with torch.amp.autocast('cuda', dtype=dtype):
-            res = model(ids, labels=ids)
-            loss = res.loss + res.aux_loss
-        loss.backward()
+        for j in range(accum):
+            ids = torch.randint(0, vocab, (args.batch_size, args.seq_len), device=device)
+            with torch.amp.autocast('cuda', dtype=dtype):
+                res = model(ids, labels=ids)
+                loss = (res.loss + res.aux_loss) / accum
+            loss.backward()
         opt.step()
         opt.zero_grad(set_to_none=True)
 
-    return step
+    return (lambda seed: step(seed)) if accum == 1 else step
 
 
 # ============================== 模式：compile-gate ==============================
@@ -90,14 +93,14 @@ def mode_compile_gate(args):
     out = {'mode': 'compile-gate', 'env': env_info(), 'results': {}}
 
     dense = build_model(args, use_moe=False)
-    out['results']['dense'] = timed(make_step(dense, args), args.warmup, args.reps)
+    out['results']['dense'] = timed(make_step(dense, args), args.warmup, args.reps, divisor=max(1, args.accum))
     del dense; torch.cuda.empty_cache()
     print(f"dense                : {fmt(out['results']['dense'])}")
 
     for e in args.experts:
         m = build_model(args, use_moe=True, num_experts=e)
         key = f'loop_e{e}'
-        out['results'][key] = timed(make_step(m, args), args.warmup, args.reps)
+        out['results'][key] = timed(make_step(m, args), args.warmup, args.reps, divisor=max(1, args.accum))
         del m; torch.cuda.empty_cache()
         print(f"moe loop   e={e:<3d}    : {fmt(out['results'][key])}")
 
@@ -107,7 +110,7 @@ def mode_compile_gate(args):
         ckey = f'compile_e{e}'
         try:
             cm = torch.compile(m)
-            out['results'][ckey] = timed(make_step(cm, args), args.warmup, args.reps)
+            out['results'][ckey] = timed(make_step(cm, args), args.warmup, args.reps, divisor=max(1, args.accum))
             out['results'][ckey]['graph_breaks'] = _graph_break_count()
             print(f"moe compile e={e:<3d}   : {fmt(out['results'][ckey])}  graph_breaks={out['results'][ckey]['graph_breaks']}")
         except Exception as ex:  # 编译失败本身就是结果，如实记录
@@ -157,7 +160,7 @@ def mode_sweep(args):
     for (bs, sl) in shapes:
         a = argparse.Namespace(**{**vars(args), 'batch_size': bs, 'seq_len': sl})
         dm = build_model(a, use_moe=False)
-        r = timed(make_step(dm, a), args.warmup, args.reps)
+        r = timed(make_step(dm, a), args.warmup, args.reps, divisor=max(1, args.accum))
         r['tokens_per_s'] = bs * sl / r['median']
         out['results'][f'dense|b{bs}s{sl}'] = r
         del dm; torch.cuda.empty_cache()
@@ -168,7 +171,7 @@ def mode_sweep(args):
                 try:
                     m = build_model(a, use_moe=True, num_experts=e, grouped=grouped)
                     _assert_path(m, a, grouped)
-                    r = timed(make_step(m, a), args.warmup, args.reps)
+                    r = timed(make_step(m, a), args.warmup, args.reps, divisor=max(1, args.accum))
                     r['tokens_per_s'] = bs * sl / r['median']
                     out['results'][key] = r
                     print(f"b{bs}xs{sl} {'grouped' if grouped else 'loop   '} e={e:<3d}: {fmt(r)}  {r['tokens_per_s']:>9.0f} tok/s")
@@ -295,6 +298,7 @@ def main():
                    type=lambda s: [tuple(int(v) for v in x.split('x')) for x in s.split(',')])
     p.add_argument('--warmup', default=10, type=int)
     p.add_argument('--reps', default=20, type=int)
+    p.add_argument('--accum', default=1, type=int, help='梯度累积步数；train_pretrain 默认为 8')
     p.add_argument('--gate_margin', default=0.15, type=float)
     p.add_argument('--out', default=None, help='写入 JSON 结果的路径')
     args = p.parse_args()
