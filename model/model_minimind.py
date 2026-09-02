@@ -159,8 +159,9 @@ class _GroupedMM(torch.autograd.Function):  # torch._grouped_mm 的自动求导�
     def backward(ctx, go):
         x, w, offs = ctx.saved_tensors
         go = go.contiguous()  # 内置 backward 在 zero-stride 的 expanded 梯度上会失败
-        gx = torch._grouped_mm(go, w.transpose(-1, -2).contiguous(), offs=offs) if ctx.needs_input_grad[0] else None
-        gw = torch._grouped_mm(x.transpose(0, 1).contiguous(), go, offs=offs) if ctx.needs_input_grad[1] else None
+        # 转置直接传视图：kernel 接受转置布局，省掉两次整块权重/激活的拷贝（gx 与拷贝版逐位相同）
+        gx = torch._grouped_mm(go, w.transpose(-1, -2), offs=offs) if ctx.needs_input_grad[0] else None
+        gw = torch._grouped_mm(x.transpose(0, 1), go, offs=offs) if ctx.needs_input_grad[1] else None
         return gx, gw, None
 
 def _grouped_mm(x, w, offs): return _GroupedMM.apply(x, w, offs)
@@ -170,10 +171,13 @@ def _grouped_dtype(x):  # autocast 下 nn.Linear 实际使用的计算精度，�
 
 def _grouped_ok(x, config):  # 能力检查：任一条不满足就回退到原来的专家循环
     if not (getattr(config, 'moe_grouped_gemm', False) and hasattr(torch, '_grouped_mm') and x.is_cuda): return False
-    if _grouped_dtype(x) != torch.bfloat16: return False  # 该私有算子目前只在 bf16 下可用
+    if _grouped_dtype(x) != torch.bfloat16: return False  # 该私有算子只接受 bf16（见 torch/_meta_registrations.py 的检查）
     if config.hidden_size % 16 or config.moe_intermediate_size % 16: return False  # 分组GEMM要求特征维16字节对齐
+    # 算力低于 9.0 时 torch 会走 _grouped_mm_fallback（源码自述 "performance may not be optimal"），
+    # 那条回退路径本身就是逐组循环，换过去只会白白多出排序/聚散开销，所以直接留在原专家循环。
+    if torch.cuda.get_device_capability(x.device) < (9, 0): return False
     dev = x.device.index
-    if dev not in _GROUPED_OK:  # 直接跑一次两段的小矩阵，比硬编码算力号更可靠
+    if dev not in _GROUPED_OK:  # 再实跑一次两段的小矩阵，覆盖算力号之外的其它限制
         try:
             _grouped_mm(torch.zeros(16, 16, device=x.device, dtype=torch.bfloat16), torch.zeros(2, 16, 16, device=x.device, dtype=torch.bfloat16), torch.tensor([8, 16], device=x.device, dtype=torch.int32))
             _GROUPED_OK[dev] = True
