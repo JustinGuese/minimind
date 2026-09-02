@@ -43,6 +43,7 @@ class MiniMindConfig(PretrainedConfig):
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
+        self.moe_grouped_gemm = kwargs.get("moe_grouped_gemm", False)  # 分组GEMM快速路径（需 CUDA + bf16 + torch._grouped_mm，默认关闭，不满足条件自动回退到专家循环）
 
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 #                                     MiniMind Model
@@ -145,6 +146,41 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
+_GROUPED_MIN_ROWS = 1024  # 路由行数低于此值时，权重堆叠的拷贝开销超过收益（decode 时 N=1 必须走循环）
+_GROUPED_OK = {}  # 每个设备只探测一次 torch._grouped_mm 是否真的可用
+
+class _GroupedMM(torch.autograd.Function):  # torch._grouped_mm 的自动求导包装：x(N,K) @ w(E,K,M)，offs 为 int32 累积END偏移
+    @staticmethod
+    def forward(ctx, x, w, offs):
+        ctx.save_for_backward(x, w, offs)
+        return torch._grouped_mm(x, w, offs=offs)
+
+    @staticmethod
+    def backward(ctx, go):
+        x, w, offs = ctx.saved_tensors
+        go = go.contiguous()  # 内置 backward 在 zero-stride 的 expanded 梯度上会失败
+        gx = torch._grouped_mm(go, w.transpose(-1, -2).contiguous(), offs=offs) if ctx.needs_input_grad[0] else None
+        gw = torch._grouped_mm(x.transpose(0, 1).contiguous(), go, offs=offs) if ctx.needs_input_grad[1] else None
+        return gx, gw, None
+
+def _grouped_mm(x, w, offs): return _GroupedMM.apply(x, w, offs)
+
+def _grouped_dtype(x):  # autocast 下 nn.Linear 实际使用的计算精度，分组路径必须与循环路径保持一致
+    return torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled('cuda') else x.dtype
+
+def _grouped_ok(x, config):  # 能力检查：任一条不满足就回退到原来的专家循环
+    if not (getattr(config, 'moe_grouped_gemm', False) and hasattr(torch, '_grouped_mm') and x.is_cuda): return False
+    if _grouped_dtype(x) != torch.bfloat16: return False  # 该私有算子目前只在 bf16 下可用
+    if config.hidden_size % 16 or config.moe_intermediate_size % 16: return False  # 分组GEMM要求特征维16字节对齐
+    dev = x.device.index
+    if dev not in _GROUPED_OK:  # 直接跑一次两段的小矩阵，比硬编码算力号更可靠
+        try:
+            _grouped_mm(torch.zeros(16, 16, device=x.device, dtype=torch.bfloat16), torch.zeros(2, 16, 16, device=x.device, dtype=torch.bfloat16), torch.tensor([8, 16], device=x.device, dtype=torch.int32))
+            _GROUPED_OK[dev] = True
+        except Exception:
+            _GROUPED_OK[dev] = False
+    return _GROUPED_OK[dev]
+
 class MOEFeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
@@ -159,21 +195,45 @@ class MOEFeedForward(nn.Module):
         scores = F.softmax(self.gate(x_flat), dim=-1)
         topk_weight, topk_idx = torch.topk(scores, k=self.config.num_experts_per_tok, dim=-1, sorted=False)
         if self.config.norm_topk_prob: topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
-        y = torch.zeros_like(x_flat)
-        for i, expert in enumerate(self.experts):
-            mask = (topk_idx == i)
-            if mask.any():
-                token_idx = mask.any(dim=-1).nonzero().flatten()
-                weight = topk_weight[mask].view(-1, 1)
-                y.index_add_(0, token_idx, (expert(x_flat[token_idx]) * weight).to(y.dtype))
-            elif self.training:
-                y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
+        if _grouped_ok(x_flat, self.config) and topk_idx.numel() >= _GROUPED_MIN_ROWS:
+            y = self._grouped_forward(x_flat, topk_idx, topk_weight)
+        else:
+            y = torch.zeros_like(x_flat)
+            for i, expert in enumerate(self.experts):
+                mask = (topk_idx == i)
+                if mask.any():
+                    token_idx = mask.any(dim=-1).nonzero().flatten()
+                    weight = topk_weight[mask].view(-1, 1)
+                    y.index_add_(0, token_idx, (expert(x_flat[token_idx]) * weight).to(y.dtype))
+                elif self.training:
+                    y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
         if self.training and self.config.router_aux_loss_coef > 0:
             load = F.one_hot(topk_idx, self.config.num_experts).float().mean(0)
             self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
         else:
             self.aux_loss = scores.new_zeros(1).squeeze()
         return y.view(batch_size, seq_len, hidden_dim)
+
+    def _grouped_forward(self, x_flat, topk_idx, topk_weight):  # 分组GEMM：把token按专家排序成连续段，一次kernel算完所有段，与上面的专家循环数学等价
+        e, k, dev = self.config.num_experts, topk_idx.shape[-1], x_flat.device
+        n, dt, ct = x_flat.shape[0], x_flat.dtype, _grouped_dtype(x_flat)
+        rows = n * k + e
+        # 给每个专家补一行权重为0的哑元：_grouped_mm 遇到零宽分组会死锁，补齐后每段宽度必然≥1。
+        # 这样 offs 可以用 searchsorted 直接算出来，整个分发过程没有任何 device→host 同步
+        #（而原循环每个专家都有 mask.any() / nonzero() 两次同步），零token专家也不需要特判。
+        pad = torch.arange(e, device=dev, dtype=topk_idx.dtype)
+        idx = torch.cat([topk_idx.reshape(-1), pad])
+        wgt = torch.cat([topk_weight.reshape(-1), topk_weight.new_zeros(e)])
+        tok = torch.arange(rows, device=dev).div_(k, rounding_mode='floor').clamp_(max=n - 1)  # 哑元行落到最后一个token，权重为0不影响结果
+        idx_s, order = torch.sort(idx, stable=True)
+        offs = torch.searchsorted(idx_s, pad, right=True).to(torch.int32)  # 累积END偏移
+        def W(name):  # 堆成 (E,K,N)：先转计算精度再转置再stack，避免额外materialize一份fp32的堆叠副本
+            return torch.stack([getattr(x, name).weight.to(ct).t() for x in self.experts])  # 无条件遍历全部专家 → DDP下每个专家参数都在计算图里
+        xs = x_flat.index_select(0, tok[order]).to(ct)
+        h = self.act_fn(_grouped_mm(xs, W('gate_proj'), offs)) * _grouped_mm(xs, W('up_proj'), offs)
+        ys = (_grouped_mm(h, W('down_proj'), offs) * wgt[order].unsqueeze(1)).to(dt)
+        inv = torch.empty_like(order).scatter_(0, order, torch.arange(rows, device=dev))
+        return ys.index_select(0, inv[:n * k]).view(n, k, -1).sum(1)  # top-k>1 时按固定顺序求和，不依赖 index_add_ 的原子累加
 
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
