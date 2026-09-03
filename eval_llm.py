@@ -16,6 +16,8 @@ def init_model(args):
             hidden_size=args.hidden_size,
             num_hidden_layers=args.num_hidden_layers,
             use_moe=bool(args.use_moe),
+            num_experts=args.num_experts,
+            num_experts_per_tok=args.num_experts_per_tok,
             inference_rope_scaling=args.inference_rope_scaling
         ))
         moe_suffix = '_moe' if args.use_moe else ''
@@ -38,6 +40,8 @@ def main():
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
+    parser.add_argument('--num_experts', default=4, type=int, help="MoE专家数量（仅use_moe=1时生效，需与训练时一致）")
+    parser.add_argument('--num_experts_per_tok', default=1, type=int, help="每个token路由到的专家数（仅use_moe=1时生效，需与训练时一致）")
     parser.add_argument('--inference_rope_scaling', default=False, action='store_true', help="启用RoPE位置编码外推（4倍，仅解决位置编码问题）")
     parser.add_argument('--max_new_tokens', default=8192, type=int, help="最大生成长度（注意：并非模型实际长文本能力）")
     parser.add_argument('--temperature', default=0.85, type=float, help="生成温度，控制随机性（0-1，越大越随机）")
