@@ -296,6 +296,92 @@ def test_cuda_real_kernel():
     assert e_diff < e_loop, f'两条路径之差({e_diff:.3e})应远小于 bf16 自身误差({e_loop:.3e})'
 
 
+# ============================== 排序分发 / sorted dispatch ==============================
+
+def sorted_pair(seed=3, **kw):
+    """一对权重相同的模块：a=上游循环，b=排序分发。二者应逐位相同（不是"在容差内"）。"""
+    a = build(seed=seed, **kw)
+    b = build(seed=seed, moe_sorted_dispatch=True, **kw)
+    b.load_state_dict(a.state_dict())  # 排序分发不改变 state_dict 结构，strict 加载必须成功
+    return a, b
+
+
+def test_sorted_default_off_and_structure():
+    """新开关默认关闭；打开后模块结构与 state_dict 键名仍与上游完全一致。"""
+    assert MiniMindConfig(use_moe=True).moe_sorted_dispatch is False, 'moe_sorted_dispatch 必须默认关闭'
+    expect = {'gate.weight'} | {f'experts.{e}.{p}_proj.weight' for e in range(4) for p in ('gate', 'up', 'down')}
+    keys = set(build(moe_sorted_dispatch=True).state_dict().keys())
+    assert keys == expect, f'排序分发不应改变 state_dict: {keys ^ expect}'
+
+
+def test_sorted_bit_identical_to_loop():
+    """排序分发与上游循环逐位相同：前向、输入梯度、每个参数梯度，train/eval × k=1,2 全覆盖。"""
+    for e, k in ((1, 1), (2, 1), (4, 1), (4, 2), (8, 2)):
+        a, b = sorted_pair(seed=3, num_experts=e, num_experts_per_tok=k)
+        torch.manual_seed(21)
+        x = torch.randn(3, 11, 64)
+        for train in (True, False):
+            a.train(train); b.train(train)
+            xa, xb = x.clone().requires_grad_(), x.clone().requires_grad_()
+            ya, yb = a(xa), b(xb)
+            assert torch.equal(ya, yb), f'E={e} k={k} train={train} 前向不是逐位相同'
+            assert torch.equal(a.aux_loss, b.aux_loss), f'E={e} k={k} aux_loss 不一致'
+            (ya.sum() + a.aux_loss).backward(); (yb.sum() + b.aux_loss).backward()
+            assert torch.equal(xa.grad, xb.grad), f'E={e} k={k} train={train} 输入梯度不是逐位相同'
+            for (n, pa), (_, pb) in zip(a.named_parameters(), b.named_parameters()):
+                assert (pa.grad is None) == (pb.grad is None), f'{n}: 梯度有无不一致'
+                if pa.grad is not None:
+                    assert torch.equal(pa.grad, pb.grad), f'E={e} k={k} {n} 梯度不是逐位相同'
+            a.zero_grad(); b.zero_grad()
+
+
+def test_sorted_edge_cases_and_ddp_grad():
+    """零token专家 / 全部到一个专家 / batch<专家数；且空专家仍须拿到梯度，否则 DDP 会挂。"""
+    for name, assign in {'零token专家': [0, 1, 0, 1, 0, 1], '全部到专家0': [0] * 6, 'batch<专家数': [1, 2]}.items():
+        a, b = sorted_pair(seed=5)
+        a.train(); b.train()
+        x = force_routing(a, assign, 64); force_routing(b, assign, 64)
+        assert torch.equal(a(x), b(x)), f'{name}: 排序分发输出与循环不是逐位相同'
+    b = build(seed=5, moe_sorted_dispatch=True); b.train()
+    x = force_routing(b, [0] * 6, 64)  # 只有专家0收到 token
+    b(x).sum().backward()
+    missing = [n for n, p in b.named_parameters() if p.grad is None]
+    assert not missing, f'{missing} 梯度为 None → DDP(find_unused_parameters=False) 会报错'
+
+
+def test_sorted_host_sync_count():
+    """本贡献的核心断言：上游循环每层约 3E 次 device→host 同步，排序分发恒为 1 次。"""
+    if not torch.cuda.is_available(): raise Skip('需要 CUDA')
+    import warnings
+    def syncs(mod, x):
+        mod(x); torch.cuda.synchronize()  # 预热，避免把首次分配算进去
+        torch.cuda.set_sync_debug_mode('warn')
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter('always'); mod(x)
+        torch.cuda.set_sync_debug_mode('default')
+        return sum('sync' in str(r.message).lower() for r in w)
+    for e in (4, 8):
+        a, b = sorted_pair(seed=3, num_experts=e)
+        a, b = a.cuda().train(), b.cuda().train()
+        x = torch.randn(2, 64, 64, device='cuda')
+        na, nb = syncs(a, x), syncs(b, x)
+        assert na >= 3 * e, f'E={e}: 上游循环同步数 {na}，预期约 3E={3 * e}'
+        assert nb == 1, f'E={e}: 排序分发同步数应恒为 1，实测 {nb}'
+
+
+def test_sorted_cuda_bit_identical():
+    """CUDA 上（fp32 与 bf16 autocast）同样必须逐位相同——排序改变了 kernel 的分块方式。"""
+    if not torch.cuda.is_available(): raise Skip('需要 CUDA')
+    for e, k in ((4, 1), (8, 2)):
+        a, b = sorted_pair(seed=3, num_experts=e, num_experts_per_tok=k)
+        a, b = a.cuda().train(), b.cuda().train()
+        torch.manual_seed(21)
+        x = torch.randn(4, 128, 64, device='cuda')
+        assert torch.equal(a(x), b(x)), f'E={e} k={k} CUDA fp32 前向不是逐位相同'
+        with torch.autocast('cuda', dtype=torch.bfloat16):
+            assert torch.equal(a(x), b(x)), f'E={e} k={k} CUDA bf16 前向不是逐位相同'
+
+
 # ============================== runner ==============================
 
 def test_init_bit_identical_from_scratch():
@@ -312,7 +398,10 @@ TESTS = [test_flag_off_default_and_structure, test_flag_off_bit_identical,
          test_checkpoint_roundtrip_both_directions, test_partial_expert_keys_raise,
          test_grouped_matches_loop, test_fused_loop_fallback_matches_loop, test_edge_cases,
          test_grad_reachability_on_grouped_path, test_capability_gate_falls_back,
-         test_min_rows_threshold_keeps_decode_on_loop, test_cuda_real_kernel]
+         test_min_rows_threshold_keeps_decode_on_loop, test_cuda_real_kernel,
+         test_sorted_default_off_and_structure, test_sorted_bit_identical_to_loop,
+         test_sorted_edge_cases_and_ddp_grad, test_sorted_host_sync_count,
+         test_sorted_cuda_bit_identical]
 
 
 def main():
