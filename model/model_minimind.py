@@ -263,19 +263,25 @@ class MOEFeedForward(nn.Module):
             self.aux_loss = scores.new_zeros(1).squeeze()
         return y.view(batch_size, seq_len, hidden_dim)
 
-    def _sorted_loop_forward(self, x_flat, topk_idx, topk_weight):
-        # 与上游循环逐位等价，只是把路由的簿记一次算完：token 先按专家排序成连续段，
-        # 每个专家直接切一段连续视图。上游每个专家都要 mask.any() / nonzero() / 布尔索引，
-        # 每次都是一趟 device→host 同步（每层约 3E 次）；这里整层只有 ends.tolist() 一次。
+    def _sort_by_expert(self, x_flat, topk_idx, topk_weight):
+        """把 token 按专家排成连续段，整层只用一次 device→host 同步换回分段边界。
+
+        上游循环里每个专家都要 mask.any() / nonzero() / 布尔索引，每次都是一趟主机往返
+        （每层约 3E 次）；这里只有 ends.tolist() 一次，且与专家数无关。
+        stable=True 保证段内 token 仍按原顺序，因此结果与上游循环逐位相同。
+        """
         e, k, dev = self.config.num_experts, topk_idx.shape[-1], x_flat.device
         flat = topk_idx.reshape(-1)
-        idx_s, order = torch.sort(flat, stable=True)  # stable 保证段内 token 仍按原顺序，逐位对齐上游
+        idx_s, order = torch.sort(flat, stable=True)
         ends = torch.searchsorted(idx_s, torch.arange(e, device=dev, dtype=flat.dtype), right=True)
         tok = order.div(k, rounding_mode='floor')
         xs = x_flat.index_select(0, tok)
         wgt = topk_weight.reshape(-1).index_select(0, order).unsqueeze(1)
-        bound, outs = [0] + ends.tolist(), []  # 整层唯一一次 device→host 同步
-        y = torch.zeros_like(x_flat)
+        return xs, wgt, tok, [0] + ends.tolist()  # 整层唯一一次 device→host 同步
+
+    def _sorted_loop_forward(self, x_flat, topk_idx, topk_weight):
+        xs, wgt, tok, bound = self._sort_by_expert(x_flat, topk_idx, topk_weight)
+        y, outs = torch.zeros_like(x_flat), []
         for i, expert in enumerate(self.experts):
             lo, hi = bound[i], bound[i + 1]
             if hi > lo: outs.append(expert(xs[lo:hi]))  # 纯 python int 比较，不再触发同步
@@ -304,16 +310,17 @@ class MOEFeedForward(nn.Module):
         inv = torch.empty_like(order).scatter_(0, order, torch.arange(rows, device=dev))
         return ys.index_select(0, inv[:n * k]).view(n, k, -1).sum(1)  # top-k>1 时按固定顺序求和，不依赖 index_add_ 的原子累加
 
-    def _fused_loop_forward(self, x_flat, topk_idx, topk_weight):  # 开关打开但环境不支持分组kernel时的回退：语义同上游循环，只是权重从融合张量里切片
-        i, y = self.config.moe_intermediate_size, torch.zeros_like(x_flat)
+    def _fused_loop_forward(self, x_flat, topk_idx, topk_weight):
+        # 开关打开但环境不支持分组 kernel 时的回退（算力低于 9.0 的显卡都走这里）。
+        # 同样先排序：回退路径没有理由把每层 3E 次主机同步再背回来，去同步不需要任何硬件支持。
+        xs, wgt, tok, bound = self._sort_by_expert(x_flat, topk_idx, topk_weight)
+        y, outs = torch.zeros_like(x_flat), []
         for x in range(self.config.num_experts):
-            mask = (topk_idx == x)
-            if mask.any():
-                token_idx = mask.any(dim=-1).nonzero().flatten()
-                weight = topk_weight[mask].view(-1, 1)
-                g, u = F.linear(x_flat[token_idx], self.gate_up_proj[x].t()).chunk(2, dim=-1)
-                y.index_add_(0, token_idx, (F.linear(self.act_fn(g) * u, self.down_proj[x].t()) * weight).to(y.dtype))
-        return y
+            lo, hi = bound[x], bound[x + 1]
+            if hi > lo:
+                g, u = F.linear(xs[lo:hi], self.gate_up_proj[x].t()).chunk(2, dim=-1)
+                outs.append(F.linear(self.act_fn(g) * u, self.down_proj[x].t()))
+        return y.index_add_(0, tok, (torch.cat(outs) * wgt).to(y.dtype)) if outs else y
 
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
